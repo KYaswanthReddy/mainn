@@ -10,10 +10,29 @@ from utils_HSI import sample_gt, metrics, seed_worker, set_requires_grad, prepro
 import time
 import os
 from datetime import datetime
+import clip
 from model.discriminator import discriminator
 from model.pmg import Generator, Dis
+from model.text_guidance import TextFeatureCache, get_dataset_prompts
 from con_losses import SupConLoss
 from sam import SAM
+def check_stage1_nan(epoch, loss_wd, loss1_1, loss2_1):
+    if torch.isnan(loss_wd) or torch.isnan(loss1_1) or torch.isnan(loss2_1):
+        print(f"\n[FATAL] NaN detected during Stage 1 pretraining at epoch {epoch}!")
+        print(f"  loss_wd: {loss_wd.item() if not torch.isnan(loss_wd) else 'NaN'}")
+        print(f"  loss1_1: {loss1_1.item() if not torch.isnan(loss1_1) else 'NaN'}")
+        print(f"  loss2_1: {loss2_1.item() if not torch.isnan(loss2_1) else 'NaN'}")
+        raise ValueError("NaN detected during Stage 1 training.")
+
+def check_stage2_nan(epoch, cls_loss, clip_loss, predict1, clip_proj1):
+    if torch.isnan(cls_loss) or torch.isnan(clip_loss):
+        print(f"\n[FATAL] NaN detected during Stage 2 training at epoch {epoch}!")
+        print(f"  cls_loss: {cls_loss.item() if not torch.isnan(cls_loss) else 'NaN'}")
+        print(f"  clip_loss: {clip_loss.item() if not torch.isnan(clip_loss) else 'NaN'}")
+        with torch.no_grad():
+            print(f"  predict1 stats - mean: {predict1.mean().item():.4f}, std: {predict1.std().item():.4f}, min: {predict1.min().item():.4f}, max: {predict1.max().item():.4f}")
+            print(f"  clip_proj1 stats - mean: {clip_proj1.mean().item():.4f}, std: {clip_proj1.std().item():.4f}, min: {clip_proj1.min().item():.4f}, max: {clip_proj1.max().item():.4f}")
+        raise ValueError("NaN/Inf detected in loss computation.")
 
 
 parser = argparse.ArgumentParser(description='PyTorch PMGDG')
@@ -37,6 +56,10 @@ parser.add_argument('--g_bool', type=bool, default=True,
                     help='g_bool')
 parser.add_argument('--sam_bool', type=bool, default=True,    
                     help='sam_bool')
+parser.add_argument('--skip_stage1', action='store_true')
+parser.add_argument('--g1_path', type=str, default='')
+parser.add_argument('--g2_path', type=str, default='')
+
 
 group_pretrain = parser.add_argument_group('preTrain')
 group_pretrain.add_argument('--pre_epoch_per_step', type=int, default=200)
@@ -46,6 +69,7 @@ group_pretrain.add_argument('--lambda_2', type=float, default=0.01)
 
 group_train = parser.add_argument_group('Training')
 group_train.add_argument('--temp', type=float, default=0.07, help='temperature for contrastive loss function')
+group_train.add_argument('--lambda_clip', type=float, default=0.1, help='weight for CLIP loss')
 group_train.add_argument('--patch_size', type=int, default=13,
                     help="Size of the spatial neighbourhood (optional, if ""absent will be set by the model)Houston:11;Pavia:7")
 group_train.add_argument('--lr', type=float, default=1e-1,
@@ -64,7 +88,7 @@ group_train.add_argument('--seed', type=int, default=333,
                     help='random seed ')
 group_train.add_argument('--gpu', type=int, default=0,
                     help="Specify CUDA device (defaults to -1, which learns on CPU)")
-group_train.add_argument('--log_interval', type=int, default=40)
+group_train.add_argument('--log_interval', type=int, default=10)
 
 
 group_model = parser.add_argument_group('model')
@@ -85,6 +109,8 @@ group_da.add_argument('--radiation_augmentation', action='store_true',default=Fa
                     help="Random radiation noise (illumination)")
 group_da.add_argument('--mixture_augmentation', action='store_true',default=False,
                     help="Random mixes between spectra")
+parser.add_argument('--prompt_type', type=str, default='original', choices=['original', 'ehsnet', 'rich'],
+                    help='Type of prompts to use for CLIP text guidance')
 args = parser.parse_args()
 def evaluate_pre(gnet, dnet, val_loader, gpu):
     ps = []
@@ -164,6 +190,26 @@ def experiment(log_dir = ''):
                                                             args.data_path)
 
     IGNORED_LABELS = list(set(IGNORED_LABELS_src) | set(IGNORED_LABELS_tar))
+    
+    print('Loading CLIP model and generating text features...')
+    device = torch.device("mps") if torch.backends.mps.is_available() else torch.device(f"cuda:{args.gpu}" if args.gpu >= 0 and torch.cuda.is_available() else "cpu")
+    clip_model, _ = clip.load("ViT-B/32", device=device)
+    if device.type == "mps":
+        clip_model.float() # MPS does not fully support fp16 embeddings
+    for param in clip_model.parameters():
+        param.requires_grad = False
+    
+    # Text feature cache for both Stage 1 (text-guided generation) and Stage 2 (CLIP loss)
+    prompts = get_dataset_prompts(args.source_name, LABEL_VALUES_src, args.prompt_type)
+    text_cache = TextFeatureCache(clip_model, LABEL_VALUES_src, device, prompts=prompts)
+    # text_features for Stage 2 CLIP loss (num_classes, 512)
+    text_features = text_cache.text_features.to(args.gpu)
+    
+    print("PMGDG device:", args.gpu)
+    print("CLIP device:", next(clip_model.parameters()).device)
+    print("Text features shape:", text_features.shape)
+    
+    logit_scale = clip_model.logit_scale.exp().to(args.gpu)
     print('load dataset')
     print('→ normalization')
     preprocess_dataset(args.source_name, img_src, gt_src, args.patch_size,
@@ -249,8 +295,8 @@ def experiment(log_dir = ''):
     else:
         layers_num = args.layers_num 
         layers = [int((N_BANDS)/layers_num)*(i+1) for i in range(layers_num-1)]+[N_BANDS]
-    g1 = Generator(imdim=N_BANDS, patch_size = hyperparams['patch_size'],layers = layers, dim1 = args.dim1, dim2 = args.dim2, device=device).to(args.gpu)
-    g2 = Generator(imdim=N_BANDS, patch_size = hyperparams['patch_size'],layers = layers, dim1 = args.dim1, dim2 = args.dim2, device=device).to(args.gpu)
+    g1 = Generator(imdim=N_BANDS, patch_size = hyperparams['patch_size'],layers = layers, dim1 = args.dim1, dim2 = args.dim2, device=device, text_dim=512).to(args.gpu)
+    g2 = Generator(imdim=N_BANDS, patch_size = hyperparams['patch_size'],layers = layers, dim1 = args.dim1, dim2 = args.dim2, device=device, text_dim=512).to(args.gpu)
     d1 = Dis(imdim=N_BANDS, patch_size = hyperparams['patch_size'],layers = layers, proj=args.pro_dim, num_classes=num_classes).to(args.gpu)
     d2 = Dis(imdim=N_BANDS, patch_size = hyperparams['patch_size'],layers = layers, proj=args.pro_dim, num_classes=num_classes).to(args.gpu)
     
@@ -259,133 +305,176 @@ def experiment(log_dir = ''):
     D1_opt = torch.optim.Adam(d1.parameters(), lr=args.pre_lr)
     D2_opt = torch.optim.Adam(d2.parameters(), lr=args.pre_lr)
     con_criterion = SupConLoss(device=args.gpu)
-    
-    best_acc1 = 0
-    best_kappa1 = 0
-    best_acc2 = 0
-    best_kappa2 = 0
-    best_g1 = None
-    best_g2 = None
-    best_d1 = None
-    best_d2 = None
-    pre_epoch = layers_num * args.pre_epoch_per_step
-    for epoch in range(pre_epoch):
-        t1 = time.time()
-        g1.train()
-        g2.train()
-        current_step =  int(epoch/(pre_epoch/layers_num)) + 1
-        # print(f'pre_step:{current_step}')
-        for i, (x, y) in enumerate(train_loader):
-            x, y = x.to(args.gpu), y.to(args.gpu)
-            y = y - 1
-            with torch.no_grad():  
-                x_g1, x_down1 = g1(x, current_step)#geneerated vs compresses/downsampled
-                x_g2, x_down2 = g2(x, current_step)
-            x_tgt1, x_down_tgt1  = g1(x, current_step)
-            x_tgt2, x_down_tgt2  = g2(x, current_step)  
-            p_SD1, z_SD1 = d1(x_down1, current_step = current_step, mode='train')#downsampled classification and features
-            p_ED1, z_ED1 = d1(x_g1, current_step = current_step, mode='train')#generated classification and features    
-            p_SD2, z_SD2 = d2(x_down2, current_step = current_step, mode='train')
-            p_ED2, z_ED2 = d2(x_g2, current_step = current_step, mode='train')
+    if not args.skip_stage1:
+      best_acc1 = 0
+      best_kappa1 = 0
+      best_acc2 = 0
+      best_kappa2 = 0
+      best_epoch1 = 0
+      best_epoch2 = 0
+      best_g1 = None
+      best_g2 = None
+      best_d1 = None
+      best_d2 = None
+      pre_epoch = layers_num * args.pre_epoch_per_step
+      for epoch in range(pre_epoch):
+          t1 = time.time()
+          g1.train()
+          g2.train()
+          current_step =  int(epoch/(pre_epoch/layers_num)) + 1
+          # print(f'pre_step:{current_step}')
+          for i, (x, y) in enumerate(train_loader):
+              x, y = x.to(args.gpu), y.to(args.gpu)
+              y = y - 1
+              # Index text features by class label for text-guided generation
+              batch_text = text_cache.index_by_labels(y)
+              with torch.no_grad():  
+                  x_g1, x_down1 = g1(x, current_step, text_features=batch_text)#geneerated vs compresses/downsampled
+                  x_g2, x_down2 = g2(x, current_step, text_features=batch_text)
+              x_tgt1, x_down_tgt1  = g1(x, current_step, text_features=batch_text)
+              x_tgt2, x_down_tgt2  = g2(x, current_step, text_features=batch_text)  
+              p_SD1, z_SD1 = d1(x_down1, current_step = current_step, mode='train')#downsampled classification and features
+              p_ED1, z_ED1 = d1(x_g1, current_step = current_step, mode='train')#generated classification and features    
+              p_SD2, z_SD2 = d2(x_down2, current_step = current_step, mode='train')
+              p_ED2, z_ED2 = d2(x_g2, current_step = current_step, mode='train')
 
-            p_src0_1, z_whole1 = d1(x, current_step = layers_num, mode='train')#original classification and features
-            p_src0_2, z_whole2 = d2(x, current_step = layers_num, mode='train')
-            p_src1, z_down1 = d1(x_down_tgt1, current_step = current_step, mode='train')#downsampled classification and features
-            p_src2, z_down2 = d2(x_down_tgt2, current_step = current_step, mode='train')
-            zwd1 = torch.cat([z_whole1.unsqueeze(1), z_down1.unsqueeze(1)], dim=1)
-            zwd2 = torch.cat([z_whole2.unsqueeze(1), z_down2.unsqueeze(1)], dim=1)
-            wd_con_loss1 = con_criterion(zwd1, y, adv=False)#l3 loss between original and downsampled features
-            wd_con_loss2 = con_criterion(zwd2, y, adv=False)
-            loss_wd =  wd_con_loss1 + wd_con_loss2
-            loss_wd.backward() #lg update the discriminator to make the features of the downsampled images close to the features of the original images, which encourages the generator to preserve more information in the downsampled features.
+              p_src0_1, z_whole1 = d1(x, current_step = layers_num, mode='train')#original classification and features
+              p_src0_2, z_whole2 = d2(x, current_step = layers_num, mode='train')
+              p_src1, z_down1 = d1(x_down_tgt1, current_step = current_step, mode='train')#downsampled classification and features
+              p_src2, z_down2 = d2(x_down_tgt2, current_step = current_step, mode='train')
+              zwd1 = torch.cat([z_whole1.unsqueeze(1), z_down1.unsqueeze(1)], dim=1)
+              zwd2 = torch.cat([z_whole2.unsqueeze(1), z_down2.unsqueeze(1)], dim=1)
+              wd_con_loss1 = con_criterion(zwd1, y, adv=False)#l3 loss between original and downsampled features
+              wd_con_loss2 = con_criterion(zwd2, y, adv=False)
+              loss_wd =  wd_con_loss1 + wd_con_loss2
+              loss_wd.backward() #lg update the discriminator to make the features of the downsampled images close to the features of the original images, which encourages the generator to preserve more information in the downsampled features.
 
-            zsrc1 = torch.cat([z_SD1.unsqueeze(1), z_ED1.unsqueeze(1)], dim=1)#downsampled and generated features for contrastive loss interclass comparison
-            zsrc2 = torch.cat([z_SD2.unsqueeze(1), z_ED2.unsqueeze(1)], dim=1)
-            
-            src_cls_loss1 = cls_criterion(p_SD1, y.long()) + cls_criterion(p_ED1, y.long())# cls classification loss for downsampled and generated features
-            src_cls_loss2 = cls_criterion(p_SD2, y.long()) + cls_criterion(p_ED2, y.long())
-            
-            
-            p_tgt1, z_tgt1 = d1(x_tgt1, current_step = current_step, mode='train')#generated image  classification and features for target domain
-            p_tgt2, z_tgt2 = d2(x_tgt2, current_step = current_step, mode='train')
-            
-            tgt_cls_loss1 = cls_criterion(p_tgt1, y.long())  #classification loss for generated features
-            tgt_cls_loss2 = cls_criterion(p_tgt2, y.long()) 
-            
-            zall1 = torch.cat([z_tgt1.unsqueeze(1), zsrc1], dim=1)
-            zall2 = torch.cat([z_tgt2.unsqueeze(1), zsrc2], dim=1)
-            
-            con_loss1 = con_criterion(zall1, y, adv=False)#generated+downsampled #l1
-            con_loss2 = con_criterion(zall2, y, adv=False)
-            loss1_1 = src_cls_loss1 + args.lambda_1 * con_loss1 + tgt_cls_loss1
-            loss1_2 = src_cls_loss2 + args.lambda_1 * con_loss2 + tgt_cls_loss2
-            D1_opt.zero_grad()  
-            loss1_1.backward(retain_graph=True)  
-            D2_opt.zero_grad() 
-            loss1_2.backward(retain_graph=True)
-            zsrc_con1 = torch.cat([z_tgt1.unsqueeze(1), z_ED1.unsqueeze(1).detach()], dim=1)
-            zsrc_con2 = torch.cat([z_tgt2.unsqueeze(1), z_ED2.unsqueeze(1).detach()], dim=1)
-            
-            con_loss_adv1 = 0
-            con_loss_adv2 = 0
-            
-            idx_1 = np.random.randint(0, zsrc1.size(1))
-            idx_2 = np.random.randint(0, zsrc2.size(1))
-            for i, id in enumerate(y.unique()):
-                mask = y == y.unique()[i]
-                z_SD_i1, zsrc_i1 = z_SD1[mask], zsrc_con1[mask]#downsampled features and generated features of the same class for contrastive loss intraclass comparison
-                y_i1 = torch.cat([torch.zeros(z_SD_i1.shape[0]), torch.ones(z_SD_i1.shape[0])]) #labels for contrastive loss, where 0 for downsampled features and 1 for generated features
-                zall1 = torch.cat([z_SD_i1.unsqueeze(1).detach(), zsrc_i1[:, idx_1:idx_1 + 1]], dim=0)#concatenate downsampled features and one randomly selected generated feature for the same class to compute contrastive loss, where the downsampled features are treated as anchors and the generated feature is treated as positive sample. This encourages the generated features to be close to the downsampled features of the same class in the feature space.
-                if y_i1.size()[0] > 2:
-                    con_loss_adv1 += con_criterion(zall1, y_i1)
-                z_SD_i2, zsrc_i2 = z_SD2[mask], zsrc_con2[mask]
-                y_i2 = torch.cat([torch.zeros(z_SD_i2.shape[0]), torch.ones(z_SD_i2.shape[0])])  
-                zall2 = torch.cat([z_SD_i2.unsqueeze(1).detach(), zsrc_i2[:, idx_2:idx_2 + 1]], dim=0)
-                
-                if y_i2.size()[0] > 2:
-                    con_loss_adv2 += con_criterion(zall2, y_i2)
-            con_loss_adv1 = con_loss_adv1 / y.unique().shape[0] #l2
-            loss2_1 = tgt_cls_loss1 + args.lambda_2 * con_loss_adv1 #classification loss for generated features and contrastive loss between generated features and downsampled features of the same class, which encourages the generated features to be close to the downsampled features of the same class in the feature space.
-            con_loss_adv2 = con_loss_adv2 / y.unique().shape[0] 
-            loss2_2 = tgt_cls_loss2 + args.lambda_2 * con_loss_adv2
-            print(f'pre_epoch:{epoch}, loss2_1: {loss2_1:.2f}  loss2_2:{loss2_2:.2f}')
-            G1_opt.zero_grad()
-            loss2_1.backward()
-            D1_opt.step()
-            G1_opt.step()
-            G2_opt.zero_grad()
-            loss2_2.backward()
-            D2_opt.step()
-            G2_opt.step()
-            
-        d1.eval()
-        d2.eval()
-        
-        teacc1, res1 = evaluate_pre(g1, d1, train_loader, args.gpu)
-        teacc2, res2 = evaluate_pre(g2, d2, train_loader, args.gpu)
+              zsrc1 = torch.cat([z_SD1.unsqueeze(1), z_ED1.unsqueeze(1)], dim=1)#downsampled and generated features for contrastive loss interclass comparison
+              zsrc2 = torch.cat([z_SD2.unsqueeze(1), z_ED2.unsqueeze(1)], dim=1)
+              
+              src_cls_loss1 = cls_criterion(p_SD1, y.long()) + cls_criterion(p_ED1, y.long())# cls classification loss for downsampled and generated features
+              src_cls_loss2 = cls_criterion(p_SD2, y.long()) + cls_criterion(p_ED2, y.long())
+              
+              
+              p_tgt1, z_tgt1 = d1(x_tgt1, current_step = current_step, mode='train')#generated image  classification and features for target domain
+              p_tgt2, z_tgt2 = d2(x_tgt2, current_step = current_step, mode='train')
+              
+              tgt_cls_loss1 = cls_criterion(p_tgt1, y.long())  #classification loss for generated features
+              tgt_cls_loss2 = cls_criterion(p_tgt2, y.long()) 
+              
+              zall1 = torch.cat([z_tgt1.unsqueeze(1), zsrc1], dim=1)
+              zall2 = torch.cat([z_tgt2.unsqueeze(1), zsrc2], dim=1)
+              
+              con_loss1 = con_criterion(zall1, y, adv=False)#generated+downsampled #l1
+              con_loss2 = con_criterion(zall2, y, adv=False)
+              loss1_1 = src_cls_loss1 + args.lambda_1 * con_loss1 + tgt_cls_loss1
+              loss1_2 = src_cls_loss2 + args.lambda_1 * con_loss2 + tgt_cls_loss2
+              D1_opt.zero_grad()  
+              loss1_1.backward(retain_graph=True)  
+              D2_opt.zero_grad() 
+              loss1_2.backward(retain_graph=True)
+              zsrc_con1 = torch.cat([z_tgt1.unsqueeze(1), z_ED1.unsqueeze(1).detach()], dim=1)
+              zsrc_con2 = torch.cat([z_tgt2.unsqueeze(1), z_ED2.unsqueeze(1).detach()], dim=1)
+              
+              con_loss_adv1 = 0
+              con_loss_adv2 = 0
+              
+              idx_1 = np.random.randint(0, zsrc1.size(1))
+              idx_2 = np.random.randint(0, zsrc2.size(1))
+              for i, id in enumerate(y.unique()):
+                  mask = y == y.unique()[i]
+                  z_SD_i1, zsrc_i1 = z_SD1[mask], zsrc_con1[mask]#downsampled features and generated features of the same class for contrastive loss intraclass comparison
+                  y_i1 = torch.cat([torch.zeros(z_SD_i1.shape[0]), torch.ones(z_SD_i1.shape[0])]) #labels for contrastive loss, where 0 for downsampled features and 1 for generated features
+                  zall1 = torch.cat([z_SD_i1.unsqueeze(1).detach(), zsrc_i1[:, idx_1:idx_1 + 1]], dim=0)#concatenate downsampled features and one randomly selected generated feature for the same class to compute contrastive loss, where the downsampled features are treated as anchors and the generated feature is treated as positive sample. This encourages the generated features to be close to the downsampled features of the same class in the feature space.
+                  if y_i1.size()[0] > 2:
+                      con_loss_adv1 += con_criterion(zall1, y_i1)
+                  z_SD_i2, zsrc_i2 = z_SD2[mask], zsrc_con2[mask]
+                  y_i2 = torch.cat([torch.zeros(z_SD_i2.shape[0]), torch.ones(z_SD_i2.shape[0])])  
+                  zall2 = torch.cat([z_SD_i2.unsqueeze(1).detach(), zsrc_i2[:, idx_2:idx_2 + 1]], dim=0)
+                  
+                  if y_i2.size()[0] > 2:
+                      con_loss_adv2 += con_criterion(zall2, y_i2)
+              con_loss_adv1 = con_loss_adv1 / y.unique().shape[0] #l2
+              loss2_1 = tgt_cls_loss1 + args.lambda_2 * con_loss_adv1 #classification loss for generated features and contrastive loss between generated features and downsampled features of the same class, which encourages the generated features to be close to the downsampled features of the same class in the feature space.
+              con_loss_adv2 = con_loss_adv2 / y.unique().shape[0] 
+              loss2_2 = tgt_cls_loss2 + args.lambda_2 * con_loss_adv2
+              check_stage1_nan(epoch, loss_wd, loss1_1, loss2_1)
+              print(f'pre_epoch:{epoch}, loss2_1: {loss2_1:.2f}  loss2_2:{loss2_2:.2f}')
+              G1_opt.zero_grad()
+              loss2_1.backward()
+              torch.nn.utils.clip_grad_norm_(d1.parameters(), max_norm=5.0)
+              torch.nn.utils.clip_grad_norm_(g1.parameters(), max_norm=5.0)
+              D1_opt.step()
+              G1_opt.step()
+              G2_opt.zero_grad()
+              loss2_2.backward()
+              torch.nn.utils.clip_grad_norm_(d2.parameters(), max_norm=5.0)
+              torch.nn.utils.clip_grad_norm_(g2.parameters(), max_norm=5.0)
+              D2_opt.step()
+              G2_opt.step()
+              
+          d1.eval()
+          d2.eval()
+          
+          teacc1, res1 = evaluate_pre(g1, d1, train_loader, args.gpu)
+          teacc2, res2 = evaluate_pre(g2, d2, train_loader, args.gpu)
 
-        if best_acc1 < teacc1:
-            best_acc1 = teacc1
-            best_kappa1 = res1["Kappa"]
-            best_g1 = g1.state_dict()
-            best_d1 = d1.state_dict()
-        if best_acc2 < teacc2:
-            best_acc2 = teacc2
-            best_kappa2 = res2["Kappa"]
-            best_g2 = g2.state_dict()
-            best_d2 = d2.state_dict()
-        if(int((epoch+1)/args.pre_epoch_per_step) + 1 != current_step):
-            g1.load_state_dict(best_g1)
-            g2.load_state_dict(best_g2)
-            d1.load_state_dict(best_d1)
-            d2.load_state_dict(best_d2)
-        t2 = time.time()
-    g1.load_state_dict(best_g1)
-    g2.load_state_dict(best_g2)
-    d1.load_state_dict(best_d1)
-    d2.load_state_dict(best_d2)
-    torch.save({'g1': g1.state_dict()}, os.path.join(log_dir, f'best_g1.pth'))
-    torch.save({'g2': g2.state_dict()}, os.path.join(log_dir, f'best_g2.pth'))
+          if best_acc1 < teacc1:
+              best_acc1 = teacc1
+              best_kappa1 = res1["Kappa"]
+              best_g1 = g1.state_dict()
+              best_d1 = d1.state_dict()
+              best_epoch1 = epoch
+          if best_acc2 < teacc2:
+              best_acc2 = teacc2
+              best_kappa2 = res2["Kappa"]
+              best_g2 = g2.state_dict()
+              best_d2 = d2.state_dict()
+              best_epoch2 = epoch
+          if(int((epoch+1)/args.pre_epoch_per_step) + 1 != current_step):
+              g1.load_state_dict(best_g1)
+              g2.load_state_dict(best_g2)
+              d1.load_state_dict(best_d1)
+              d2.load_state_dict(best_d2)
+          t2 = time.time()
+          
+    if args.skip_stage1:
+        print("SKIPPING STAGE-1")
+        print("Loading saved G1/G2...")
+        print("Loading saved G1/G2...")
+
+        g1_ckpt = torch.load(args.g1_path, map_location='cpu', weights_only=False)
+        g2_ckpt = torch.load(args.g2_path, map_location='cpu', weights_only=False)
+        print(type(g1_ckpt))
+        print(g1_ckpt.keys())
+        g1.load_state_dict(g1_ckpt['g1'])
+        g2.load_state_dict(g2_ckpt['g2'])
+
+    else:
+        print("\n" + "="*60)
+        print("STAGE-1 BEST MODELS SELECTED")
+        print(f"G1 Best Epoch : {best_epoch1}")
+        print(f"G1 Best Acc   : {best_acc1:.2f}")
+        print(f"G1 Best Kappa : {best_kappa1:.4f}")
+        print()
+        print(f"G2 Best Epoch : {best_epoch2}")
+        print(f"G2 Best Acc   : {best_acc2:.2f}")
+        print(f"G2 Best Kappa : {best_kappa2:.4f}")
+        print("="*60 + "\n")
+
+        print("Loading best G1 and G2 for Stage-2 training...")
+
+        g1.load_state_dict(best_g1)
+        g2.load_state_dict(best_g2)
+
+        d1.load_state_dict(best_d1)
+        d2.load_state_dict(best_d2)
+
+        torch.save({'g1': g1.state_dict()},
+                  os.path.join(log_dir, 'best_g1.pth'))
+
+        torch.save({'g2': g2.state_dict()},
+                  os.path.join(log_dir, 'best_g2.pth'))
 
     D_net = discriminator(inchannel=N_BANDS, outchannel=args.pro_dim, num_classes=num_classes, patch_size=hyperparams['patch_size']).to(args.gpu)
 
@@ -396,6 +485,7 @@ def experiment(log_dir = ''):
         D_opt = torch.optim.Adam(D_net.parameters(), lr=args.lr)
     best_acc = 0
     best_kappa = 0
+    best_tpr = None
     for epoch in range(1,args.max_epoch+1):
         t1 = time.time()    
         loss_list = []
@@ -406,28 +496,47 @@ def experiment(log_dir = ''):
             y = y - 1
             if args.g_bool:
                 with torch.no_grad():
-                    x1,_ = g1(x,layers_num)
-                    x2,_ = g2(x,layers_num)
+                    batch_text = text_cache.index_by_labels(y)
+                    x1,_ = g1(x,layers_num, text_features=batch_text)
+                    x2,_ = g2(x,layers_num, text_features=batch_text)
                     y1 = y
                     y2 = y
                 x = torch.cat((x,x1,x2),dim=0)
                 y = torch.cat((y,y1,y2),dim=0)
             if args.sam_bool:
                 D_sam.zero_grad()
-                predict1 = D_net(x.detach())#cls+proj
-                loss = cls_criterion(predict1, y.long())#classification loss for the discriminator, which encourages the discriminator to correctly classify the samples into their respective classes.
+                predict1, _, clip_proj1 = D_net(x.detach(), mode='train')#cls+proj+clip_proj
+                cls_loss = cls_criterion(predict1, y.long())
+                clip_loss = torch.nn.functional.cross_entropy(logit_scale * clip_proj1 @ text_features.t(), y.long())
+                loss = cls_loss + args.lambda_clip * clip_loss
+                check_stage2_nan(epoch, cls_loss, clip_loss, predict1, clip_proj1)
+                print(
+                    f"epoch:{epoch} "
+                    f"cls_loss:{cls_loss.item():.4f} "
+                    f"clip_loss:{clip_loss.item():.4f} "
+                    f"total_loss:{loss.item():.4f}"
+                )
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(D_net.parameters(), max_norm=5.0)
                 D_sam.first_step(zero_grad=True)
-                predict1 = D_net(x.detach())
-                loss = cls_criterion(predict1, y.long())
+                predict1, _, clip_proj1 = D_net(x.detach(), mode='train')
+                cls_loss = cls_criterion(predict1, y.long())
+                clip_loss = torch.nn.functional.cross_entropy(logit_scale * clip_proj1 @ text_features.t(), y.long())
+                loss = cls_loss + args.lambda_clip * clip_loss
+                check_stage2_nan(epoch, cls_loss, clip_loss, predict1, clip_proj1)
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(D_net.parameters(), max_norm=5.0)
                 D_sam.second_step(zero_grad=True)
                 loss_list.append(loss.item())
             else:
                 D_opt.zero_grad()
-                predict1 = D_net(x.detach())
-                loss = cls_criterion(predict1, y.long())
+                predict1, _, clip_proj1 = D_net(x.detach(), mode='train')
+                cls_loss = cls_criterion(predict1, y.long())
+                clip_loss = torch.nn.functional.cross_entropy(logit_scale * clip_proj1 @ text_features.t(), y.long())
+                loss = cls_loss + args.lambda_clip * clip_loss
+                check_stage2_nan(epoch, cls_loss, clip_loss, predict1, clip_proj1)
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(D_net.parameters(), max_norm=5.0)
                 D_opt.step()
                 loss_list.append(loss.item())
         loss_mean = np.mean(loss_list, 0)
@@ -439,6 +548,7 @@ def experiment(log_dir = ''):
         if best_acc < taracc:
             best_acc = taracc
             best_kappa = results["Kappa"]
+            best_tpr = results["TPR"]
             torch.save({'Discriminator': D_net.state_dict()}, os.path.join(log_dir, f'best.pth'))
             train_res['best_epoch'] = epoch
             train_res['best_acc'] = '{:.2f}'.format(best_acc)
@@ -455,6 +565,38 @@ def experiment(log_dir = ''):
         for key, value in train_res.items():
             f.write(f"{key}: {value}\n")
     f.close()
+    
+    if best_tpr is not None:
+        best_aa = np.mean(best_tpr) * 100
+    else:
+        best_aa = 0.0
+        
+    print(f"--- Best Epoch Metrics ---")
+    print(f"OA: {best_acc:.2f}% | AA: {best_aa:.2f}% | Kappa: {best_kappa:.4f}")
+    
+    # Save the prompt comparison metrics to a CSV file in the results folder
+    import csv
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    results_dir = os.path.join(base_dir, 'results')
+    if not os.path.exists(results_dir):
+        os.makedirs(results_dir)
+    comparison_file = os.path.join(results_dir, 'prompt_comparison.csv')
+    file_exists = os.path.isfile(comparison_file)
+    
+    with open(comparison_file, 'a', newline='') as csvfile:
+        writer = csv.writer(csvfile)
+        if not file_exists:
+            writer.writerow(['Timestamp', 'Source', 'Target', 'Prompt Type', 'OA', 'AA', 'Kappa'])
+        
+        writer.writerow([
+            datetime.strftime(datetime.now(), '%Y-%m-%d %H:%M:%S'),
+            args.source_name,
+            args.target_name,
+            args.prompt_type,
+            '{:.2f}'.format(best_acc),
+            '{:.2f}'.format(best_aa),
+            '{:.4f}'.format(best_kappa)
+        ])
     return best_acc, best_kappa
     
 def work():

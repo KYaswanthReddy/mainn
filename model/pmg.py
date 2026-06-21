@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from model.text_guidance import LightweightImageEncoder, MultiHeadCrossAttention, AdaLN3d
 class discriminator(nn.Module):
 
     def __init__(self, inchannel, outchannel, num_classes, patch_size):
@@ -79,7 +80,7 @@ class Spa_Spe_Randomization(nn.Module):
 
 class Generator_3DCNN_SupCompress_pca(nn.Module):
 
-    def __init__(self, imdim=3, imsize=[13, 13], device=0, dim1=128, dim2=8):
+    def __init__(self, imdim=3, imsize=[13, 13], device=0, dim1=128, dim2=8, text_dim=0):
         super().__init__()
 
         self.patch_size = imsize[0]
@@ -97,8 +98,14 @@ class Generator_3DCNN_SupCompress_pca(nn.Module):
                                out_channels=self.n_channel,
                                kernel_size=(3, 3, 3))
 
-        
-        self.Spa_Spe_Random = Spa_Spe_Randomization(device=device)
+        # Style mixing: text-conditioned when text_dim > 0, original otherwise
+        if text_dim > 0:
+            self.ada_ln = AdaLN3d(n_channel=self.n_channel, text_dim=text_dim)
+            self.Spa_Spe_Random = None
+        else:
+            self.ada_ln = None
+            self.Spa_Spe_Random = Spa_Spe_Randomization(device=device)
+        self.text_guided = text_dim > 0
 
         # 
         self.conv6 = nn.ConvTranspose3d(in_channels=self.n_channel, out_channels=1, kernel_size=(3, 3, 3))
@@ -106,7 +113,7 @@ class Generator_3DCNN_SupCompress_pca(nn.Module):
         # 2D_CONV
         self.conv_inverse_pca = nn.Conv2d(self.n_pca, imdim, 1, 1)
 
-    def forward(self, x):
+    def forward(self, x, text_cond=None):
         x = self.conv_pca(x)
 
         x = x.reshape(-1, self.patch_size, self.patch_size, self.inchannel, 1)  # (256,48,13,13,1)
@@ -114,7 +121,10 @@ class Generator_3DCNN_SupCompress_pca(nn.Module):
 
         x = F.relu(self.conv1(x))
 
-        x, idx_swap = self.Spa_Spe_Random(x)
+        if self.text_guided:
+            x = self.ada_ln(x, text_cond)
+        else:
+            x, idx_swap = self.Spa_Spe_Random(x)
 
         x = torch.sigmoid(self.conv6(x))
 
@@ -143,7 +153,7 @@ def downsample(img, m):
     return reduced_img
 #doubt 
 class Generator(nn.Module):
-    def __init__(self, imdim=48, patch_size=13, layers = [], dim1 = 128, dim2 = 8, device=0):
+    def __init__(self, imdim=48, patch_size=13, layers = [], dim1 = 128, dim2 = 8, device=0, text_dim=0):
         super().__init__()
         self.patch_size = patch_size
         self.n_channel = imdim
@@ -157,9 +167,19 @@ class Generator(nn.Module):
         for i in range(self.layers_num-1):
             self.upsamples.append(nn.Conv2d(in_channels=self.dims[i], out_channels=self.dims[i+1], kernel_size=1) )
         for i in range(self.layers_num):
-            self.sub_g.append(Generator_3DCNN_SupCompress_pca(imdim=self.dims[i], imsize=[13, 13], device=device, dim1=dim1, dim2=dim2))
+            self.sub_g.append(Generator_3DCNN_SupCompress_pca(imdim=self.dims[i], imsize=[13, 13], device=device, dim1=dim1, dim2=dim2, text_dim=text_dim))
         
-    def forward(self, x, current_step = 9999):
+        if text_dim > 0:
+            self.image_encoder = LightweightImageEncoder(in_channels=imdim)
+            self.cross_attention = MultiHeadCrossAttention(img_dim=imdim, text_dim=text_dim)
+            self.stabilize_norm = nn.GroupNorm(1, imdim)
+        else:
+            self.image_encoder = None
+            self.cross_attention = None
+            self.stabilize_norm = None
+        self.text_guided = text_dim > 0
+        
+    def forward(self, x, current_step = 9999, text_features=None):
         if current_step <= self.layers_num:
             if current_step > 1:
                 self.sub_g[current_step-2].requires_grad_(False)
@@ -169,12 +189,20 @@ class Generator(nn.Module):
                 x_down = self.conv_pcas[current_step-1](x)
             else:
                 x_down = x
-            if len(self.dims) > 1:
-                x_g = self.sub_g[0](downsample(x, self.dims[0]))#starting with downsampled input for the first generator
+                
+            if self.text_guided and text_features is not None:
+                img_feats = self.image_encoder(x)
+                x_att = self.cross_attention(img_feats, text_features)
+                x_att = self.stabilize_norm(x_att + x)
             else:
-                x_g = self.sub_g[0](x)
+                x_att = x
+                
+            if len(self.dims) > 1:
+                x_g = self.sub_g[0](downsample(x_att, self.dims[0]), text_cond=text_features)#starting with downsampled input for the first generator
+            else:
+                x_g = self.sub_g[0](x_att, text_cond=text_features)
             for i in range(1, current_step):
-                x_g = self.sub_g[i](self.upsamples[i-1](x_g))#ending with upsampled output for the last generator
+                x_g = self.sub_g[i](self.upsamples[i-1](x_g), text_cond=text_features)#ending with upsampled output for the last generator
             return x_g, x_down
         else:
             if current_step < self.layers_num*2:

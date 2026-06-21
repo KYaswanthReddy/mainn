@@ -18,17 +18,14 @@ class discriminator(nn.Module):
         self.relu3 = nn.ReLU(inplace=True)
         self.fc2 = nn.Linear(dim, dim)
         self.relu4 = nn.ReLU(inplace=True)
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(dim, dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(dim, dim),
-            nn.ReLU(inplace=True),
-        )
         self.cls_head_src = nn.Linear(dim, num_classes)
-        # self.p_mu = nn.Linear(dim, outchannel, nn.LeakyReLU())
         self.pro_head = nn.Linear(dim, outchannel, nn.ReLU())
+        # CLIP projection: branch directly from 512-dim feature (not 128-dim proj)
+        self.clip_pro_head = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(dim, 512),
+        )
         
     def _get_final_flattened_size(self):
         with torch.no_grad():
@@ -50,15 +47,17 @@ class discriminator(nn.Module):
         out2 = out2.view(in_size, -1)
         out3 = self.relu3(self.fc1(out2))
         out4 = self.relu4(self.fc2(out3))
-        # out4 = self.mlp(out4)
         if mode == 'test':
             clss = self.cls_head_src(out4)
             return clss
         elif mode == 'train':
-            proj = F.normalize(self.pro_head(out4))
+            proj = self.pro_head(out4)
+            proj_norm = F.normalize(proj)
+            # CLIP projection from 512-dim feature directly (avoids 128-dim bottleneck)
+            clip_proj = F.normalize(self.clip_pro_head(out4))
             clss = self.cls_head_src(out4)
 
-            return clss, proj
+            return clss, proj_norm, clip_proj
 
 # model = discriminator(inchannel=176, outchannel=512, num_classes=12, patch_size=13)
 # model = discriminator(inchannel=48, outchannel=512/, num_classes=7, patch_size=13)
