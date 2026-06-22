@@ -1,4 +1,6 @@
 import warnings
+
+from verify_text_guidance import N_BANDS
 warnings.filterwarnings("ignore")
 import numpy as np
 import random
@@ -231,8 +233,12 @@ def experiment(log_dir = ''):
     tmp = args.training_sample_ratio*args.re_ratio*sample_num_src/sample_num_tar
     num_classes = gt_src.max()
     N_BANDS = img_src.shape[-1]
+    print("Source shape:", img_src.shape)
+    print("Target shape:", img_tar.shape)
+    print("N_BANDS =", N_BANDS)
     hyperparams.update({'n_classes': num_classes, 'n_bands': N_BANDS, 'ignored_labels': IGNORED_LABELS, 
                         'device': args.gpu, 'center_pixel': None, 'supervision': 'full'})
+    
 
     r = int(hyperparams['patch_size']/2)+1
     img_src=np.pad(img_src,((r,r),(r,r),(0,0)),'symmetric')
@@ -253,7 +259,7 @@ def experiment(log_dir = ''):
     hyperparams_train = hyperparams.copy()
     hyperparams_train['flip_augmentation'] = True
     hyperparams_train['radiation_augmentation'] = True
-
+    hyperparams_train['mixture_augmentation'] = args.mixture_augmentation
     g = torch.Generator()
     g.manual_seed(args.seed)
     train_dataset = HyperX(img_src_con, train_gt_src_con, **hyperparams_train)
