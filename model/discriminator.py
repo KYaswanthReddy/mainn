@@ -4,7 +4,7 @@ import torch.nn.functional as F
 
 class discriminator(nn.Module):
 
-    def __init__(self, inchannel, outchannel, num_classes, patch_size):
+    def __init__(self, inchannel, outchannel, num_classes, patch_size, dropout=0.0):
         super(discriminator, self).__init__()
         dim = 512
         self.patch_size = patch_size
@@ -18,6 +18,7 @@ class discriminator(nn.Module):
         self.relu3 = nn.ReLU(inplace=True)
         self.fc2 = nn.Linear(dim, dim)
         self.relu4 = nn.ReLU(inplace=True)
+        self.dropout = nn.Dropout(p=dropout) if dropout > 0.0 else None
         self.cls_head_src = nn.Linear(dim, num_classes)
         self.pro_head = nn.Linear(dim, outchannel, nn.ReLU())
         # CLIP projection: branch directly from 512-dim feature (not 128-dim proj)
@@ -46,7 +47,11 @@ class discriminator(nn.Module):
         out2 = self.mp(self.relu2(self.conv2(out1)))
         out2 = out2.view(in_size, -1)
         out3 = self.relu3(self.fc1(out2))
+        if self.dropout is not None:
+            out3 = self.dropout(out3)
         out4 = self.relu4(self.fc2(out3))
+        if self.dropout is not None:
+            out4 = self.dropout(out4)
         if mode == 'test':
             clss = self.cls_head_src(out4)
             return clss
